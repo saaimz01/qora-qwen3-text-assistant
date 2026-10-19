@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local Text Assistant</title>
+</head>
+<body>
+
+<h1>Local Text Assistant</h1>
+<p>Model: qwen3:4b (runs on your machine)</p>
+
+<fieldset>
+  <legend>Mode</legend>
+  <label><input type="radio" name="mode" value="summarize" checked> Summarize</label>
+  <label><input type="radio" name="mode" value="infer"> Infer</label>
+  <label><input type="radio" name="mode" value="transform"> Transform</label>
+  <label><input type="radio" name="mode" value="custom"> Custom prompt</label>
+  <p id="desc"></p>
+  <p id="option-row" hidden>
+    <label id="option-label" for="option"></label>
+    <input id="option" list="suggestions">
+    <datalist id="suggestions"></datalist>
+  </p>
+</fieldset>
+
+<h2>Conversation</h2>
+<div id="messages">
+  <p id="empty">Pick a mode, type or paste some text below and press Send.</p>
+</div>
+
+<form id="composer">
+  <p>
+    <label id="text-label" for="text">Your text</label><br>
+    <textarea id="text" rows="6" cols="60"></textarea>
+  </p>
+  <p>
+    <button type="submit" id="send">Send</button>
+    <button type="button" id="stop" disabled>Stop</button>
+    <button type="button" id="clear">Clear conversation</button>
+  </p>
+  <p id="status" role="alert"></p>
+</form>
+
+<script>
+  // The prompt templates for Summarize / Infer / Transform live in the backend.
+  // This page sends { mode, text, option } to POST /api/chat and reads a streamed text reply.
+  // In "custom" mode, text is the whole prompt and option is empty.
+  const MODES = {
+    summarize: {
+      label: "Summarize",
+      desc: "Shortens your text to a word limit.",
+      textLabel: "Your text",
+      option: { label: "Max words:", type: "number", value: "30" },
+    },
+    infer: {
+      label: "Infer",
+      desc: "Reads your text and returns sentiment, emotions and topics as JSON.",
+      textLabel: "Your text",
+      option: null,
+    },
+    transform: {
+      label: "Transform",
+      desc: "Translate, change the tone, or proofread. Leave the box blank to proofread.",
+      textLabel: "Your text",
+      option: {
+        label: "What to do:",
+        type: "text",
+        value: "",
+        suggestions: ["Proofread and fix grammar", "Translate to Urdu", "Translate to French", "Make it more formal", "Make it friendlier"],
+      },
+    },
+    custom: {
+      label: "Custom prompt",
+      desc: "Whatever you type below is sent to the model as the prompt.",
+      textLabel: "Your prompt",
+      option: null,
+    },
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const descEl = $("desc"), optionRow = $("option-row"), optionEl = $("option");
+  const messagesEl = $("messages"), emptyEl = $("empty");
+  const textEl = $("text"), sendBtn = $("send"), stopBtn = $("stop"), statusEl = $("status");
+
+  const optionValues = {};
+  for (const [key, m] of Object.entries(MODES)) optionValues[key] = m.option ? m.option.value : "";
+
+  let mode = "summarize";
+  let controller = null;
+
+  // ---------- mode options ----------
+  function renderMode() {
+    const m = MODES[mode];
+    descEl.textContent = m.desc;
+    $("text-label").textContent = m.textLabel;
+
+    optionRow.hidden = !m.option;
+    if (m.option) {
+      $("option-label").textContent = m.option.label;
+      optionEl.type = m.option.type;
+      optionEl.value = optionValues[mode];
+      const list = $("suggestions");
+      list.innerHTML = "";
+      (m.option.suggestions || []).forEach((s) => {
+        const o = document.createElement("option");
+        o.value = s;
+        list.appendChild(o);
+      });
+    }
+  }
+
+  document.querySelectorAll('input[name="mode"]').forEach((radio) => {
+    radio.addEventListener("change", () => { mode = radio.value; renderMode(); });
+  });
+  optionEl.addEventListener("input", () => { optionValues[mode] = optionEl.value; });
+
+  // ---------- messages ----------
+  // Show text with its line breaks, without using any styling
+  function setText(el, text) {
+    el.textContent = "";
+    text.split("\n").forEach((line, i) => {
+      if (i) el.appendChild(document.createElement("br"));
+      el.appendChild(document.createTextNode(line));
+    });
+  }
+
+  function addMessage(who, text) {
+    emptyEl.hidden = true;
+    const p = document.createElement("p");
+    p.className = "message";
+    const name = document.createElement("b");
+    name.textContent = who;
+    const body = document.createElement("span");
+    setText(body, text);
+    p.append(name, document.createElement("br"), body);
+    messagesEl.appendChild(p);
+    return { p, body };
+  }
+
+  function prettyJson(raw) {
+    const start = raw.indexOf("{"), end = raw.lastIndexOf("}");
+    if (start === -1 || end <= start) return null;
+    try { return JSON.stringify(JSON.parse(raw.slice(start, end + 1)), null, 2); }
+    catch { return null; }
+  }
+
+  // ---------- sending ----------
+  function setBusy(on) {
+    sendBtn.disabled = on;
+    stopBtn.disabled = !on;
+  }
+
+  async function send() {
+    const text = textEl.value.trim();
+    const option = (optionValues[mode] || "").trim();
+    statusEl.textContent = "";
+
+    if (!text) { statusEl.textContent = "Please type something first."; textEl.focus(); return; }
+
+    let who = "You (" + MODES[mode].label;
+    if (mode === "summarize" && option) who += ", max " + option + " words";
+    if (mode === "transform" && option) who += ", " + option;
+    who += "):";
+
+    addMessage(who, text);
+    textEl.value = "";
+    const bot = addMessage("Assistant:", "Thinking...");
+    setBusy(true);
+    controller = new AbortController();
+
+    let reply = "";
+    let failed = false;
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode, text, option }),
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error((await res.text()) || "Server returned " + res.status);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        reply += decoder.decode(value, { stream: true });
+        setText(bot.body, reply);
+      }
+    } catch (err) {
+      if (err.name === "AbortError") {
+        setText(bot.body, reply ? reply + " [stopped]" : "[stopped]");
+      } else {
+        failed = true;
+        setText(bot.body, "Could not get a reply. Is the server running, and is Ollama started?\n" + err.message);
+      }
+    } finally {
+      setBusy(false);
+      controller = null;
+    }
+
+    if (!failed && !reply.trim() && bot.body.textContent === "Thinking...") {
+      setText(bot.body, "(empty reply)");
+    }
+    if (!failed && mode === "infer") {
+      const pretty = prettyJson(reply);
+      if (pretty) {
+        const pre = document.createElement("pre");
+        pre.textContent = pretty;
+        bot.body.replaceWith(pre);
+      }
+    }
+    textEl.focus();
+  }
+
+  $("composer").addEventListener("submit", (e) => { e.preventDefault(); send(); });
+  stopBtn.addEventListener("click", () => { if (controller) controller.abort(); });
+  $("clear").addEventListener("click", () => {
+    if (controller) controller.abort();
+    messagesEl.querySelectorAll(".message").forEach((n) => n.remove());
+    emptyEl.hidden = false;
+    statusEl.textContent = "";
+  });
+
+  renderMode();
+</script>
+</body>
+</html>
