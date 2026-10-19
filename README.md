@@ -1,4 +1,4 @@
-# Local Text Assistant
+# Qora - A Local Text Assistant
 
 A local text assistant powered by **Qwen3 4B** through the **Ollama Python API**, served by a **FastAPI** backend that streams replies to a plain HTML page. It runs entirely on your own machine: no cloud API, no API key, no data leaving your computer.
 
